@@ -26,10 +26,12 @@ import logging
 from typing import Optional
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-DODO_WEBHOOK_SECRET = os.environ["DODO_WEBHOOK_SECRET"]
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "change-this-secret")
+DODO_API_KEY        = os.environ.get("DODO_API_KEY", "")
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY        = os.environ.get("SUPABASE_KEY", "")
+JWT_SECRET          = os.environ.get("JWT_SECRET", "vbai-secret-2025")
+DODO_WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET", "")
 
 # ── INIT ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="VBAi License Server", version="1.0.0")
