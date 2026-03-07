@@ -35,7 +35,7 @@ DODO_WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET", "")
 
 # ── INIT ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="VBAi License Server", version="1.0.0")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vbai")
 
