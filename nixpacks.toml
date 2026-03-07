@@ -1,0 +1,15 @@
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+```
+
+**5.** Click **"Commit new file"** → green button
+
+**6.** Also update `runtime.txt` → change it to just:
+```
+python-3.12.3
