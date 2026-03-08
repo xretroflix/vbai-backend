@@ -149,72 +149,118 @@ async def debug_email_test(email: str = "test@example.com", admin: str = ""):
 @app.post("/register")
 async def register(req: RegisterRequest):
     """
-    NO EMAIL VERIFICATION — register instantly, go straight to Dodo checkout.
-    Uses Supabase admin API to create user with email auto-confirmed.
+    NO EMAIL VERIFICATION.
+    Since Supabase "Confirm email" is OFF, sign_up creates a confirmed user instantly.
+    No email step — goes straight to Dodo checkout.
     """
     ensure_db()
     email = ne(req.email)
     if len(req.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     try:
-        # Use admin API to create user with email pre-confirmed — no verification email sent
-        res = supabase.auth.admin.create_user({
+        # Step 1: Create user via sign_up
+        # Works instantly when Supabase "Confirm email" is turned OFF
+        res = supabase.auth.sign_up({
             "email": email,
             "password": req.password,
-            "email_confirm": True,   # ← skip email verification entirely
-            "user_metadata": {
+            "options": {"data": {
                 "first_name": req.first_name,
                 "last_name": req.last_name,
                 "country": req.country,
                 "plan": req.plan
-            }
+            }}
         })
-        if res.user:
-            # Sign them in immediately to get a session
-            try:
-                sign_in = supabase.auth.sign_in_with_password({"email": email, "password": req.password})
-                uid = str(sign_in.user.id) if sign_in.user else str(res.user.id)
-            except:
-                uid = str(res.user.id)
 
-            token = make_jwt(email, uid)
+        if not res.user:
+            raise HTTPException(400, "Could not create account. Please try again.")
 
-            # Create license record
-            try:
-                supabase.table("licenses").upsert({
-                    "email": email, "status": "email_verified", "plan": "trial",
-                    "first_name": req.first_name, "last_name": req.last_name,
-                    "country": req.country, "ai_credits": 20,
-                    "created_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
-                }).execute()
-            except Exception as e:
-                log.warning(f"DB upsert warn: {e}")
+        # Already confirmed = existing user trying to register again
+        uid = str(res.user.id)
 
-            # Return JWT + checkout URL — frontend goes straight to payment
-            plan = req.plan or "monthly"
-            base = DODO_CHECKOUT_MONTHLY if plan != "annual" else DODO_CHECKOUT_ANNUAL
-            checkout_url = f"{base}&email={email}"
-
-            log.info(f"Registered (no-verify): {email}")
-            return {
-                "success": True,
+        # Step 2: Sign in immediately to confirm account is accessible
+        try:
+            sign_in = supabase.auth.sign_in_with_password({
                 "email": email,
-                "token": token,
-                "checkout_url": checkout_url,
-                "next": "checkout",
-                "message": "Account created! Setting up your trial..."
-            }
+                "password": req.password
+            })
+            if sign_in.user:
+                uid = str(sign_in.user.id)
+        except Exception as si_err:
+            log.warning(f"Sign-in after register warn: {si_err}")
+            # Not fatal — we have uid from sign_up
 
-        raise HTTPException(400, "Registration failed. Please try again.")
+        # Step 3: Issue our own JWT
+        token = make_jwt(email, uid)
+
+        # Step 4: Create/update license record
+        try:
+            supabase.table("licenses").upsert({
+                "email": email,
+                "status": "trial",
+                "plan": "trial",
+                "first_name": req.first_name,
+                "last_name": req.last_name,
+                "country": req.country,
+                "ai_credits": 20,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+        except Exception as db_err:
+            log.warning(f"License upsert warn: {db_err}")
+
+        # Step 5: Build checkout URL
+        plan = req.plan or "monthly"
+        base = DODO_CHECKOUT_MONTHLY if plan != "annual" else DODO_CHECKOUT_ANNUAL
+        checkout_url = f"{base}&email={email}"
+
+        log.info(f"✅ Registered: {email} | plan: {plan}")
+        return {
+            "success": True,
+            "email": email,
+            "token": token,
+            "checkout_url": checkout_url,
+            "next": "checkout",
+            "message": "Account created!"
+        }
 
     except HTTPException: raise
     except Exception as e:
         es = str(e).lower()
+        log.error(f"Register error for {req.email}: {type(e).__name__}: {e}")
         if "already registered" in es or "already exists" in es or "user already" in es or "duplicate" in es:
-            raise HTTPException(409, "This email is already registered. Please log in.")
-        log.error(f"Register error: {e}")
-        raise HTTPException(500, "Registration failed. Please try again.")
+            raise HTTPException(409, "This email is already registered. Please log in instead.")
+        # Return exact error in dev — helps debug
+        raise HTTPException(500, f"Registration failed: {str(e)[:120]}")
+
+@app.get("/debug/register-test")
+async def debug_register_test(email: str = "", admin: str = ""):
+    """Quick test: can we create a user? Returns exact Supabase response."""
+    if admin != ADMIN_KEY:
+        raise HTTPException(403, "Admin key required")
+    if not email:
+        return {"error": "Pass ?email=test@example.com&admin=YOUR_ADMIN_KEY"}
+    ensure_db()
+    results = {"email": email, "steps": {}}
+    try:
+        res = supabase.auth.sign_up({
+            "email": email.strip().lower(),
+            "password": "TempPass123!",
+            "options": {"data": {"first_name": "Test", "last_name": "User"}}
+        })
+        if res.user:
+            results["steps"]["sign_up"] = "✅ User created"
+            results["steps"]["user_id"] = str(res.user.id)
+            results["steps"]["confirmed"] = str(res.user.email_confirmed_at)
+            if res.user.email_confirmed_at:
+                results["steps"]["status"] = "✅ Auto-confirmed (Confirm email is OFF)"
+            else:
+                results["steps"]["status"] = "⚠️ NOT confirmed — go to Supabase → Auth → Email → turn OFF Confirm email"
+        else:
+            results["steps"]["sign_up"] = "❌ No user returned"
+    except Exception as e:
+        results["steps"]["sign_up"] = f"❌ Error: {str(e)}"
+        results["steps"]["hint"] = "Check SUPABASE_URL and SUPABASE_KEY in Railway vars"
+    return results
 
 @app.post("/resend-otp")
 async def resend_otp(req: ResendOTPRequest):
