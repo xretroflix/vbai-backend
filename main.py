@@ -59,7 +59,86 @@ def ensure_db():
 
 @app.get("/health")
 async def health():
-    return {"status":"ok","service":"VBAi Studio API","version":"4.0.0","time":datetime.utcnow().isoformat(),"db":"connected" if supabase else "not configured"}
+    db_status = "not configured"
+    if supabase:
+        try:
+            supabase.table("licenses").select("count").limit(1).execute()
+            db_status = "connected"
+        except: db_status = "error"
+    return {
+        "status": "ok",
+        "service": "VBAi Studio API",
+        "version": "4.1.0",
+        "time": datetime.utcnow().isoformat(),
+        "db": db_status,
+        "anthropic_key": "set" if os.environ.get("ANTHROPIC_API_KEY") else "NOT SET",
+        "supabase_url": "set" if SUPABASE_URL else "NOT SET",
+    }
+
+@app.get("/debug/email-test")
+async def debug_email_test(email: str = "test@example.com", admin: str = ""):
+    """
+    Diagnostic route — tests the full Supabase email flow.
+    Call: /debug/email-test?email=YOUR_EMAIL&admin=vbai-admin-2025
+    Returns exactly what Supabase returns so you can see the error.
+    """
+    if admin != ADMIN_KEY:
+        raise HTTPException(403, "Admin key required")
+    if not supabase:
+        return {"error": "Supabase not connected — check SUPABASE_URL and SUPABASE_KEY in Railway vars"}
+    results = {}
+    # Test 1: Can we reach Supabase at all?
+    try:
+        supabase.table("licenses").select("count").limit(1).execute()
+        results["supabase_db"] = "✅ Connected"
+    except Exception as e:
+        results["supabase_db"] = f"❌ DB Error: {str(e)}"
+    # Test 2: Try sign_up and capture exact response
+    try:
+        test_email = email.strip().lower()
+        res = supabase.auth.sign_up({
+            "email": test_email,
+            "password": "TestPass123!",
+            "options": {"data": {"first_name": "Debug", "last_name": "Test"}}
+        })
+        if res.user:
+            results["sign_up"] = "✅ User created"
+            results["user_id"] = str(res.user.id)
+            results["email_confirmed"] = str(res.user.email_confirmed_at)
+            results["confirmation_sent_at"] = str(res.user.confirmation_sent_at)
+            if res.user.email_confirmed_at:
+                results["email_status"] = "⚠️ Email already confirmed (existing user) — no new email sent"
+            elif res.user.confirmation_sent_at:
+                results["email_status"] = "✅ Confirmation email was SENT by Supabase"
+            else:
+                results["email_status"] = "❌ Email NOT sent — check Supabase SMTP settings"
+        else:
+            results["sign_up"] = "❌ No user returned"
+            results["raw_response"] = str(res)
+    except Exception as e:
+        err = str(e)
+        results["sign_up"] = f"❌ Error: {err}"
+        if "already registered" in err.lower():
+            results["hint"] = "Email already exists — try a different test email"
+        elif "smtp" in err.lower() or "email" in err.lower():
+            results["hint"] = "SMTP error — Resend credentials wrong in Supabase"
+        elif "rate" in err.lower():
+            results["hint"] = "Rate limited — wait 60 seconds and try again"
+    results["instructions"] = {
+        "if_email_not_sent": [
+            "1. Go to Supabase Dashboard → Authentication → SMTP Settings",
+            "2. Make sure 'Enable Custom SMTP' is TOGGLED ON (green)",
+            "3. Host: smtp.resend.com | Port: 465 | User: resend",
+            "4. Password: your Resend API key (starts with re_)",
+            "5. Sender email: onboarding@resend.dev (use this until domain verified)",
+            "6. Click Save and test again"
+        ],
+        "if_smtp_error": [
+            "Go to resend.com → API Keys → make sure key is active",
+            "Copy the key again and re-paste into Supabase SMTP password field"
+        ]
+    }
+    return results
 
 @app.post("/register")
 async def register(req: RegisterRequest):
