@@ -148,24 +148,41 @@ async def debug_email_test(email: str = "test@example.com", admin: str = ""):
 
 @app.post("/register")
 async def register(req: RegisterRequest):
+    """
+    NO EMAIL VERIFICATION — register instantly, go straight to Dodo checkout.
+    Uses Supabase admin API to create user with email auto-confirmed.
+    """
     ensure_db()
     email = ne(req.email)
     if len(req.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     try:
-        res = supabase.auth.sign_up({
-            "email": email, "password": req.password,
-            "options": {"data": {"first_name": req.first_name, "last_name": req.last_name,
-                                  "country": req.country, "plan": req.plan}}
+        # Use admin API to create user with email pre-confirmed — no verification email sent
+        res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": req.password,
+            "email_confirm": True,   # ← skip email verification entirely
+            "user_metadata": {
+                "first_name": req.first_name,
+                "last_name": req.last_name,
+                "country": req.country,
+                "plan": req.plan
+            }
         })
         if res.user:
-            # Already confirmed = existing active user → tell them to log in
-            if res.user.email_confirmed_at:
-                raise HTTPException(409, "This email is already registered and confirmed. Please log in.")
-            # New or unconfirmed user — confirmation email sent by Supabase
+            # Sign them in immediately to get a session
+            try:
+                sign_in = supabase.auth.sign_in_with_password({"email": email, "password": req.password})
+                uid = str(sign_in.user.id) if sign_in.user else str(res.user.id)
+            except:
+                uid = str(res.user.id)
+
+            token = make_jwt(email, uid)
+
+            # Create license record
             try:
                 supabase.table("licenses").upsert({
-                    "email": email, "status": "pending", "plan": "trial",
+                    "email": email, "status": "email_verified", "plan": "trial",
                     "first_name": req.first_name, "last_name": req.last_name,
                     "country": req.country, "ai_credits": 20,
                     "created_at": datetime.utcnow().isoformat(),
@@ -173,31 +190,36 @@ async def register(req: RegisterRequest):
                 }).execute()
             except Exception as e:
                 log.warning(f"DB upsert warn: {e}")
-            log.info(f"Registered: {email}")
-            return {"success": True, "email": email, "next": "verify_email",
-                    "message": "Confirmation email sent. Click the link in your inbox."}
+
+            # Return JWT + checkout URL — frontend goes straight to payment
+            plan = req.plan or "monthly"
+            base = DODO_CHECKOUT_MONTHLY if plan != "annual" else DODO_CHECKOUT_ANNUAL
+            checkout_url = f"{base}&email={email}"
+
+            log.info(f"Registered (no-verify): {email}")
+            return {
+                "success": True,
+                "email": email,
+                "token": token,
+                "checkout_url": checkout_url,
+                "next": "checkout",
+                "message": "Account created! Setting up your trial..."
+            }
+
         raise HTTPException(400, "Registration failed. Please try again.")
+
     except HTTPException: raise
     except Exception as e:
         es = str(e).lower()
-        if "already registered" in es or "already exists" in es or "user already" in es:
+        if "already registered" in es or "already exists" in es or "user already" in es or "duplicate" in es:
             raise HTTPException(409, "This email is already registered. Please log in.")
         log.error(f"Register error: {e}")
-        raise HTTPException(500, f"Registration failed. Please try again.")
+        raise HTTPException(500, "Registration failed. Please try again.")
 
 @app.post("/resend-otp")
 async def resend_otp(req: ResendOTPRequest):
-    """Resend confirmation link — handles both new and already-registered unconfirmed emails."""
-    ensure_db()
-    email = ne(req.email)
-    try:
-        supabase.auth.resend({"type": "signup", "email": email})
-        log.info(f"Resent confirmation to: {email}")
-        return {"success": True, "message": "Confirmation email resent. Check inbox and spam folder."}
-    except Exception as e:
-        log.error(f"Resend error: {e}")
-        # Always return success — don't reveal if email exists (security)
-        return {"success": True, "message": "If this email is registered, a new confirmation has been sent."}
+    # Kept for compatibility — not used in no-verify flow
+    return {"success": True, "message": "Please log in directly with your email and password."}
 
 @app.post("/verify-email")
 async def verify_email(req: VerifyOTPRequest):
