@@ -282,6 +282,151 @@ async def grant_access(req: AdminGrantRequest):
     supabase.table("licenses").upsert({"email":email,"status":"active","plan":req.plan,"expires_at":ea,"activated_at":datetime.utcnow().isoformat(),"updated_at":datetime.utcnow().isoformat()}).execute()
     return {"granted":True,"email":email,"plan":req.plan,"expires_at":ea}
 
+# ── AI PROXY ROUTES ──────────────────────────────────────────────────────────────
+# These proxy calls to Anthropic using VBAi's API key (never exposed to browser)
+# Requires valid JWT + active subscription
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY","")
+ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
+
+SYSTEM_GENERATE = """You are VBAi Studio's VBA code generator. Generate Excel VBA macro code only.
+Rules: Always wrap in Sub/End Sub. Use meaningful variable names. Add brief comments.
+Output ONLY the VBA code — no explanation, no markdown fences, no preamble."""
+
+SYSTEM_EXPLAIN = """You are a VBA teacher. Explain the given VBA code clearly for a non-programmer.
+Use simple language. Format: 1 sentence summary, then bullet points for each main action.
+Be concise — max 200 words."""
+
+SYSTEM_FIX = """You are a VBA debugger. Fix the given VBA code. 
+Output: brief explanation of the bug (1-2 sentences), then the corrected full code.
+Output ONLY explanation + fixed code — no markdown fences."""
+
+class AIRequest(BaseModel):
+    prompt: str
+    mode: str = "generate"          # generate | explain | fix | improve | convert
+    model: Optional[str] = None     # auto-selected if None
+    context: Optional[str] = ""    # extra context (Indian format, etc)
+    error_msg: Optional[str] = ""  # for fix mode
+
+def get_auth_email(authorization: str) -> str:
+    """Extract email from Bearer JWT. Raises 401 if invalid."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Authentication required. Please log in.")
+    try:
+        payload = jwt.decode(authorization.split(" ",1)[1], JWT_SECRET, algorithms=["HS256"])
+        return payload["sub"]
+    except Exception:
+        raise HTTPException(401, "Session expired. Please log in again.")
+
+def check_subscription(email: str) -> dict:
+    """Return license row. Raises 403 if not active/trial."""
+    if not supabase:
+        return {"status":"active","plan":"pro"}  # fail-open if DB down
+    try:
+        r = supabase.table("licenses").select("*").eq("email",email).limit(1).execute()
+        if not r.data:
+            raise HTTPException(403, "No subscription found. Please complete payment setup.")
+        row = r.data[0]
+        status = row.get("status","")
+        # Allow active subscriptions and email-verified (grace period before Dodo webhook)
+        if status in ("active", "email_verified"):
+            return row
+        elif status in ("expired","cancelled","payment_failed"):
+            raise HTTPException(403, f"Subscription {status}. Please renew at vbai.online")
+        elif status in ("pending",):
+            raise HTTPException(403, "Please complete payment setup to access the builder.")
+        return row  # any other status: allow
+    except HTTPException: raise
+    except Exception as e:
+        log.error(f"Subscription check error: {e}")
+        return {"status":"active","plan":"pro"}  # fail-open
+
+@app.get("/subscription/status")
+async def subscription_status(authorization: str = Header(None)):
+    """Called by builder.html on load to check auth + subscription state."""
+    email = get_auth_email(authorization)
+    row = check_subscription(email)
+    # Calculate trial days remaining
+    days_left = None
+    activated = row.get("activated_at") or row.get("created_at")
+    if activated and row.get("status") == "active":
+        try:
+            act_dt = datetime.fromisoformat(activated.replace("Z",""))
+            days_left = max(0, 3 - (datetime.utcnow() - act_dt).days)
+        except: pass
+    return {
+        "email": email,
+        "status": row.get("status","active"),
+        "plan": row.get("plan","pro"),
+        "first_name": row.get("first_name",""),
+        "days_left": days_left,
+        "ai_credits": row.get("ai_credits", 20),
+    }
+
+@app.post("/ai/generate")
+async def ai_generate(req: AIRequest, authorization: str = Header(None)):
+    """Generate VBA macro via Claude. Requires active subscription."""
+    email = get_auth_email(authorization)
+    check_subscription(email)
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI service not configured. Please contact support.")
+
+    # Build prompt based on mode
+    mode_prefix = {
+        "generate": "Generate this Excel VBA macro: ",
+        "improve":  "Improve this Excel VBA code:\n",
+        "convert":  "Convert this Excel formula to a VBA macro:\n",
+        "explain":  "Explain this VBA code clearly:\n",
+        "fix":      "Fix this VBA code" + (f" that gives error: {req.error_msg}" if req.error_msg else "") + ":\n",
+    }
+    full_prompt = mode_prefix.get(req.mode, "") + req.prompt
+    if req.context:
+        full_prompt += "\n\n" + req.context
+
+    # Route to appropriate model
+    mode = req.mode
+    model = req.model or ("claude-haiku-4-5-20251001" if mode in ("explain",) else "claude-sonnet-4-6")
+    system = SYSTEM_EXPLAIN if mode=="explain" else SYSTEM_FIX if mode=="fix" else SYSTEM_GENERATE
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                ANTHROPIC_ENDPOINT,
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 1500,
+                    "system": system,
+                    "messages": [{"role":"user","content": full_prompt}]
+                }
+            )
+            if not r.is_success:
+                log.error(f"Anthropic error {r.status_code}: {r.text[:200]}")
+                raise HTTPException(502, "AI service error. Please try again.")
+            data = r.json()
+            result_text = data["content"][0]["text"]
+
+        # Deduct 1 AI credit from user's allocation
+        try:
+            current = supabase.table("licenses").select("ai_credits").eq("email",email).limit(1).execute()
+            current_credits = (current.data[0].get("ai_credits") or 20) if current.data else 20
+            if current_credits > 0:
+                supabase.table("licenses").update({"ai_credits": max(0, current_credits-1),"updated_at":datetime.utcnow().isoformat()}).eq("email",email).execute()
+        except: pass
+
+        return {"success": True, "code": result_text, "model": model, "email": email}
+
+    except HTTPException: raise
+    except Exception as e:
+        log.error(f"AI generate error: {e}")
+        raise HTTPException(502, "AI generation failed. Please try again.")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
