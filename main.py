@@ -26,16 +26,14 @@ import logging
 from typing import Optional
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-DODO_API_KEY        = os.environ.get("DODO_API_KEY", "")
-ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
-SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY        = os.environ.get("SUPABASE_KEY", "")
-JWT_SECRET          = os.environ.get("JWT_SECRET", "vbai-secret-2025")
-DODO_WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+DODO_WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET", "placeholder")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "vbai-admin-2025")
 
 # ── INIT ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="VBAi License Server", version="1.0.0")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vbai")
 
@@ -77,7 +75,7 @@ async def verify_dodo_signature(request: Request, x_dodo_signature: str = Header
         DODO_WEBHOOK_SECRET.encode(),
         body,
         hashlib.sha256
-    ).hexdigest()
+    ).hexdigest()  # type: ignore
     return hmac.compare_digest(f"sha256={expected}", x_dodo_signature)
 
 # ── ROUTES ──────────────────────────────────────────────────────────────────────
