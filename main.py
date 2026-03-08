@@ -168,6 +168,70 @@ async def check_license(email: str):
         log.error(f"License error: {e}")
         return {"email":email,"status":"free","plan":"free","expires_at":None,"daily_prompt_limit":3,"message":"Server error"}
 
+class ConfirmLinkRequest(BaseModel):
+    token_hash: str
+    type: Optional[str] = "signup"
+
+class ExchangeTokenRequest(BaseModel):
+    access_token: str
+    refresh_token: Optional[str] = None
+
+@app.post("/confirm-link")
+async def confirm_link(req: ConfirmLinkRequest):
+    """
+    Called by auth/callback.html after Supabase sends a magic link.
+    Supabase embeds token_hash in the confirmation URL.
+    We verify it via Supabase Auth, create our own JWT, return checkout URL.
+    """
+    ensure_db()
+    try:
+        # Exchange the token_hash for a session using Supabase Auth
+        res = supabase.auth.verify_otp({
+            "token_hash": req.token_hash,
+            "type": req.type or "signup"
+        })
+        if res.user and res.session:
+            email = ne(res.user.email or "")
+            token = make_jwt(email, str(res.user.id))
+            # Update license status to confirmed
+            try:
+                supabase.table("licenses").update({
+                    "status": "email_verified",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }).eq("email", email).execute()
+            except: pass
+            log.info(f"✅ Magic link confirmed: {email}")
+            return {"success": True, "token": token, "email": email}
+        raise HTTPException(400, "Invalid or expired confirmation link. Please register again.")
+    except HTTPException: raise
+    except Exception as e:
+        log.error(f"Confirm link error: {e}")
+        raise HTTPException(400, "Confirmation failed. The link may have expired. Please register again.")
+
+@app.post("/exchange-token")
+async def exchange_token(req: ExchangeTokenRequest):
+    """Fallback: exchange Supabase access_token (from URL hash) for our JWT."""
+    ensure_db()
+    try:
+        # Get user info from Supabase using their access token
+        res = supabase.auth.get_user(req.access_token)
+        if res.user:
+            email = ne(res.user.email or "")
+            token = make_jwt(email, str(res.user.id))
+            try:
+                supabase.table("licenses").update({
+                    "status": "email_verified",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }).eq("email", email).execute()
+            except: pass
+            log.info(f"✅ Token exchanged: {email}")
+            return {"success": True, "token": token, "email": email}
+        raise HTTPException(401, "Invalid access token.")
+    except HTTPException: raise
+    except Exception as e:
+        log.error(f"Exchange token error: {e}")
+        raise HTTPException(401, "Could not process session. Please log in manually.")
+
 @app.post("/webhook/dodo")
 async def dodo_webhook(request: Request, x_dodo_signature: str = Header(None)):
     body = await request.body()
